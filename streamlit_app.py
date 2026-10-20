@@ -12,6 +12,8 @@ st.set_page_config(
 league_id = str(st.secrets["SLEEPER_LEAGUE_ID"])
 API_BASE = "https://api.sleeper.app/v1"
 
+PROJECTIONS_BASE = "https://api.sleeper.app/projections/nfl"
+PROJECTION_FIELDS = {1.0: "pts_ppr", 0.5: "pts_half_ppr", 0.0: "pts_std"}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_league(league_id, first_week, last_week):
@@ -62,6 +64,64 @@ def load_league(league_id, first_week, last_week):
 
     return league, pd.DataFrame(rows)
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_starters(league_id, first_week, last_week):
+    """One row per starter per team per week, with actual points."""
+    rows = []
+    with requests.Session() as session:
+        for week in range(first_week, last_week + 1):
+            response = session.get(
+                f"{API_BASE}/league/{league_id}/matchups/{week}", timeout=30
+            )
+            response.raise_for_status()
+            for team in response.json() or []:
+                starters = team.get("starters") or []
+                points = team.get("starters_points") or []
+                for player_id, actual in zip(starters, points):
+                    if player_id in (None, "0"):
+                        continue  # empty lineup slot
+                    rows.append({
+                        "week": week,
+                        "roster_id": team["roster_id"],
+                        "player_id": str(player_id),
+                        "actual_points": actual,
+                    })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_projections(season, first_week, last_week, scoring_field):
+    """One row per player per week, with projected points."""
+    params = [("season_type", "regular")] + [
+        ("position[]", p) for p in ["QB", "RB", "WR", "TE", "K", "DEF"]
+    ]
+    rows = []
+    with requests.Session() as session:
+        for week in range(first_week, last_week + 1):
+            response = session.get(
+                f"{PROJECTIONS_BASE}/{season}/{week}",
+                params=params,
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            entries = data if isinstance(data, list) else list(data.values())
+            for entry in entries:
+                if not entry:
+                    continue
+                info = entry.get("player") or {}
+                stats = entry.get("stats") or {}
+                rows.append({
+                    "week": week,
+                    "player_id": str(entry.get("player_id")),
+                    "player_name": (
+                        f"{info.get('first_name', '')} "
+                        f"{info.get('last_name', '')}"
+                    ).strip(),
+                    "position": info.get("position"),
+                    "projected_points": stats.get(scoring_field) or 0.0,
+                })
+    return pd.DataFrame(rows).drop_duplicates(["week", "player_id"])
 
 def calculate_analytics(raw):
     df = raw.copy()
@@ -173,6 +233,93 @@ def calculate_analytics(raw):
     ).reset_index(drop=True)
 
 
+DUD_RATIO = 0.5  # dud = scored under 50% of projection
+
+
+def calculate_matchup_luck(weekly, starters, projections):
+    """Measure how much each winner benefited from opponent underperformance."""
+    players = starters.merge(projections, on=["week", "player_id"], how="left")
+    players["projected_points"] = players["projected_points"].fillna(0.0)
+    players["actual_points"] = pd.to_numeric(
+        players["actual_points"], errors="coerce"
+    ).fillna(0.0)
+    players["player_name"] = players["player_name"].fillna("").astype(str)
+
+    # Zero-projection starters are manager error, not luck: exclude them.
+    counted = players.loc[players["projected_points"] > 0].copy()
+    counted["is_dud"] = (
+        counted["actual_points"] < DUD_RATIO * counted["projected_points"]
+    )
+    counted["dud_points"] = (
+        counted["projected_points"] - counted["actual_points"]
+    ).where(counted["is_dud"], 0.0)
+
+    team_week = counted.groupby(["week", "roster_id"], as_index=False).agg(
+        projected_total=("projected_points", "sum"),
+        counted_actual=("actual_points", "sum"),
+        duds=("is_dud", "sum"),
+        dud_points=("dud_points", "sum"),
+    )
+    dud_names = (
+        counted.loc[counted["is_dud"]]
+        .groupby(["week", "roster_id"])["player_name"]
+        .agg(", ".join)
+        .rename("dud_players")
+        .reset_index()
+    )
+    team_week = team_week.merge(dud_names, on=["week", "roster_id"], how="left")
+
+    # Link each team to its opponent that week.
+    pairs = weekly[["week", "matchup_id", "roster_id"]]
+    opponents = pairs.merge(pairs, on=["week", "matchup_id"], suffixes=("", "_opp"))
+    opponents = opponents.loc[
+        opponents["roster_id"] != opponents["roster_id_opp"],
+        ["week", "roster_id", "roster_id_opp"],
+    ]
+
+    # Wins only, with the losing opponent's projection stats attached.
+    wins = weekly.loc[weekly["result"] == "Win", [
+        "week", "roster_id", "display_name", "opponent_display_name",
+        "points_scored", "opponent_points",
+    ]].merge(opponents, on=["week", "roster_id"], how="left")
+
+    opp_stats = team_week.rename(columns={
+        "roster_id": "roster_id_opp",
+        "projected_total": "opp_projected",
+        "counted_actual": "opp_counted_actual",
+        "duds": "opp_duds",
+        "dud_points": "opp_dud_points",
+        "dud_players": "opp_dud_players",
+    })
+    wins = wins.merge(opp_stats, on=["week", "roster_id_opp"], how="left")
+    for column in ["opp_projected", "opp_counted_actual", "opp_duds", "opp_dud_points"]:
+        wins[column] = wins[column].fillna(0.0)
+    wins["opp_dud_players"] = wins["opp_dud_players"].fillna("")
+
+    # Shortfall: negative (opponent beat projection) counts as 0 luck.
+    raw_shortfall = wins["opp_projected"] - wins["opp_counted_actual"]
+    wins["shortfall"] = raw_shortfall.clip(lower=0)
+
+    # Stolen win: opponent's expected score would have beaten yours.
+    wins["opp_expected"] = wins["opponent_points"] + raw_shortfall
+    wins["stolen_win"] = wins["points_scored"] < wins["opp_expected"]
+
+    summary = wins.groupby(["roster_id", "display_name"], as_index=False).agg(
+        wins=("week", "count"),
+        stolen_wins=("stolen_win", "sum"),
+        total_shortfall=("shortfall", "sum"),
+        duds_faced=("opp_duds", "sum"),
+        dud_points=("opp_dud_points", "sum"),
+    )
+    summary["avg_shortfall_per_win"] = (
+        summary["total_shortfall"] / summary["wins"]
+    )
+    summary = summary.sort_values(
+        ["avg_shortfall_per_win", "stolen_wins"], ascending=False
+    ).reset_index(drop=True)
+
+    return wins.sort_values(["week", "display_name"]), summary
+
 st.title("🏈 Who’s Getting the Breaks?")
 st.write(
     "Compare actual results with how each manager scored "
@@ -190,6 +337,8 @@ with st.sidebar:
     st.caption("Choose completed weeks so results reflect final scores.")
     if st.button("Refresh data"):
         load_league.clear()
+        load_starters.clear()
+        load_projections.clear()
 
 if not league_id.strip().isdigit():
     st.info("Enter a valid numeric Sleeper league ID.")
@@ -214,6 +363,18 @@ except (requests.RequestException, ValueError, KeyError) as error:
 if summary.empty:
     st.info("No scored head-to-head matchups found for these weeks.")
     st.stop()
+    # Matchup luck data. The projections feed is unofficial, so fail softly.
+luck_error = None
+try:
+    rec = float(league.get("scoring_settings", {}).get("rec", 0))
+    scoring_field = PROJECTION_FIELDS.get(rec, "pts_ppr")
+    starters = load_starters(league_id.strip(), first_week, last_week)
+    projections = load_projections(
+        league.get("season"), first_week, last_week, scoring_field
+    )
+    luck_wins, luck_summary = calculate_matchup_luck(weekly, starters, projections)
+except (requests.RequestException, ValueError, KeyError) as error:
+    luck_error = error
 
 st.subheader(league.get("name", "League analytics"))
 st.caption(
@@ -228,8 +389,8 @@ st.info(
     "**Standing change:** positive means the manager would move up."
 )
 
-standings_tab, luck_tab, weekly_tab = st.tabs([
-    "Standings", "Schedule luck", "Weekly results"
+standings_tab, luck_tab, matchup_tab, weekly_tab = st.tabs([
+    "Standings", "Schedule luck", "Matchup luck", "Weekly results"
 ])
 
 with standings_tab:
@@ -305,6 +466,145 @@ with standings_tab:
         "Swipe horizontally to see all columns."
     )
 
+with matchup_tab:
+    import altair as alt
+
+    if luck_error is not None:
+        st.warning(f"Matchup luck is unavailable right now: {luck_error}")
+    else:
+        st.write(
+            "How much each manager's **wins** were helped by opponents "
+            "falling short of their projections."
+        )
+
+        # Leaderboard: every manager, including those with no wins yet.
+        leaderboard = summary[["roster_id", "display_name"]].merge(
+            luck_summary, on=["roster_id", "display_name"], how="left"
+        )
+        count_columns = ["wins", "stolen_wins", "duds_faced"]
+        leaderboard[count_columns] = leaderboard[count_columns].fillna(0).astype(int)
+        point_columns = ["total_shortfall", "dud_points"]
+        leaderboard[point_columns] = leaderboard[point_columns].fillna(0.0)
+        leaderboard = leaderboard.sort_values(
+            "avg_shortfall_per_win", ascending=False, na_position="last"
+        ).reset_index(drop=True)
+
+        board = leaderboard.rename(columns={
+            "display_name": "Manager",
+            "wins": "Wins",
+            "avg_shortfall_per_win": "Avg shortfall per win",
+            "stolen_wins": "Stolen wins",
+            "duds_faced": "Duds faced",
+            "dud_points": "Dud points",
+            "total_shortfall": "Total shortfall",
+        })[[
+            "Manager", "Wins", "Avg shortfall per win", "Stolen wins",
+            "Duds faced", "Dud points", "Total shortfall",
+        ]]
+
+        st.subheader("Luck leaderboard")
+        st.dataframe(
+            board.style.format({
+                "Avg shortfall per win": lambda v: "No wins" if pd.isna(v) else f"{v:.2f}",
+                "Dud points": "{:.2f}",
+                "Total shortfall": "{:.2f}",
+            }),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        # Chart: managers with at least one win.
+        chart_data = board.loc[board["Wins"] > 0]
+        if not chart_data.empty:
+            chart = alt.Chart(chart_data).mark_bar(color="#4393c3").encode(
+                x=alt.X(
+                    "Avg shortfall per win:Q",
+                    title="Average opponent shortfall per win (points)",
+                ),
+                y=alt.Y("Manager:N", sort="-x", title=None),
+                tooltip=[
+                    "Manager:N",
+                    "Wins:Q",
+                    "Stolen wins:Q",
+                    alt.Tooltip("Avg shortfall per win:Q", format=".2f"),
+                    "Duds faced:Q",
+                ],
+            )
+            st.altair_chart(
+                chart.properties(height=max(300, len(chart_data) * 32)),
+                use_container_width=True,
+            )
+
+        # Shared formatting for the win-level tables.
+        details = luck_wins.rename(columns={
+            "week": "Week",
+            "display_name": "Winner",
+            "opponent_display_name": "Opponent",
+            "points_scored": "Winner points",
+            "opponent_points": "Opponent points",
+            "opp_projected": "Opponent projected",
+            "shortfall": "Shortfall",
+            "stolen_win": "Stolen win",
+            "opp_duds": "Duds",
+            "opp_dud_points": "Dud points",
+            "opp_dud_players": "Dud players",
+        })
+        details["Stolen win"] = details["Stolen win"].map({True: "Yes", False: ""})
+        detail_columns = [
+            "Week", "Winner", "Opponent", "Winner points", "Opponent points",
+            "Opponent projected", "Shortfall", "Stolen win", "Duds",
+            "Dud points", "Dud players",
+        ]
+        detail_format = {
+            "Winner points": "{:.2f}",
+            "Opponent points": "{:.2f}",
+            "Opponent projected": "{:.2f}",
+            "Shortfall": "{:.2f}",
+            "Duds": "{:.0f}",
+            "Dud points": "{:.2f}",
+        }
+
+        st.subheader("Luckiest wins")
+        top_wins = details.sort_values("Shortfall", ascending=False).head(10)
+        st.dataframe(
+            top_wins[detail_columns].style.format(detail_format),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        st.subheader("Wins by manager")
+        selected_luck = st.selectbox(
+            "Manager",
+            options=leaderboard["display_name"].tolist(),
+            key="matchup_luck_manager",
+        )
+        manager_wins = details.loc[
+            details["Winner"] == selected_luck
+        ].sort_values("Week")
+        if manager_wins.empty:
+            st.info(f"{selected_luck} has no wins in the selected weeks.")
+        else:
+            st.dataframe(
+                manager_wins[detail_columns].style.format(detail_format),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        with st.expander("How matchup luck works"):
+            st.markdown("""
+- **Wins only:** for every win, we look at the losing opponent's starters.
+- **Opponent projected:** the sum of the opponent's starter projections
+  (Sleeper projections, matched to your league's scoring).
+- **Shortfall:** opponent projected minus opponent actual. If the opponent
+  beat their projection, shortfall is 0.
+- **Avg shortfall per win:** total shortfall divided by wins. This is the ranking.
+- **Stolen win:** you won, but your opponent would have beaten your score
+  if their starters had hit their projections.
+- **Dud:** an opposing starter who scored under 50% of their projection.
+  **Dud points** is how far those duds fell short in total.
+- **Zero-projection starters** (like a player on bye or ruled out) are
+  excluded. Starting them is manager error, not luck for the winner.
+""")
     with st.expander("View detailed statistics"):
         st.dataframe(
             styled,
@@ -416,3 +716,4 @@ with st.expander("How the calculations work"):
 Only rows with scores for both scheduled opponents are included.
 Scores alone do not indicate that a week has finished; select completed weeks.
 """)
+

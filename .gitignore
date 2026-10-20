@@ -2,3 +2,5 @@ main.ipynb
 main.py
 .venv/
 .streamlit/secrets.toml
+check_projections.py
+check_projections.py
