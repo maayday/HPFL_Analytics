@@ -1,0 +1,4 @@
+main.ipynb
+main.py
+.venv/
+.streamlit/secrets.toml
